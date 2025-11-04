@@ -3,33 +3,43 @@ from pathlib import Path
 from urllib.parse import quote_plus
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# ================= CONFIG =================
+# =============== CONFIG ===============
 WATCHLIST = {
-    "TSLA": "Tesla",
+    # "TSLA": "Tesla",
     "NVDA": "NVIDIA",
-    "AAPL": "Apple",
+    # "AAPL": "Apple",
+    # "AMZN": "Amazon",
+    # "GOOGL": "Alphabet",
+    # "MSFT": "Microsoft",
+    # "META": "Meta Platforms",
+    # "NFLX": "Netflix",
+    # "INTC": "Intel",
+    # "AMD": "Advanced Micro Devices",    
 }
-LOOKBACK_MIN = 180            # window for clustering (minutes)
-STRONG_POS = 0.6              # VADER positive threshold
-STRONG_NEG = -0.6              # VADER negative threshold
-CLUSTER_COUNT = 3             # how many strong hits to alert
-ALERT_COOLDOWN_MIN = 120      # min gap between alerts per ticker
-POLL_NEWS_HOURS = 6           # how far back to query in Google News
+LOOKBACK_MIN = 180             # cluster window (minutes)
+STRONG_POS = 0.6               # threshold after BLEND
+STRONG_NEG = -0.6
+CLUSTER_COUNT = 3              # strong hits to trigger alert
+ALERT_COOLDOWN_MIN = 120       # min minutes between alerts per ticker
+POLL_NEWS_HOURS = 6            # recent hours in Google News query
+FINBERT_MAX_ITEMS = 60         # cap FinBERT scoring per ticker per run
+BLEND_ALPHA = 0.7              # alpha*FinBERT + (1-alpha)*VADER
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 STATE_PATH = Path("state.json")
 an = SentimentIntensityAnalyzer()
 
-# ================= UTILITIES =================
+# =============== UTILS ===============
 def now_ts(): return int(dt.datetime.utcnow().timestamp())
 
 def google_news_rss(query: str):
-    # URL-encode the query to avoid spaces/quotes issues
-    q = quote_plus(query)
+    q = quote_plus(query)  # IMPORTANT: encode spaces/quotes/$
     return f"https://news.google.com/rss/search?q={q}+when:{POLL_NEWS_HOURS}h&hl=en-US&gl=US&ceid=US:en"
 
-def senti(text: str): return an.polarity_scores((text or "")[:2000])["compound"]
+def senti_vader(text: str):
+    return an.polarity_scores((text or "")[:2000])["compound"]
 
 def get_pub_ts(entry):
     for k in ("published_parsed", "updated_parsed"):
@@ -39,10 +49,8 @@ def get_pub_ts(entry):
 
 def load_state():
     if STATE_PATH.exists():
-        try:
-            return json.loads(STATE_PATH.read_text())
-        except Exception:
-            pass
+        try: return json.loads(STATE_PATH.read_text())
+        except Exception: pass
     return {"seen_ids": {}, "last_alert": {}}
 
 def save_state(state): STATE_PATH.write_text(json.dumps(state, indent=2))
@@ -51,8 +59,7 @@ def domain_from_url(u: str):
     m = re.search(r"https?://([^/]+)/?", u)
     if not m: return ""
     d = m.group(1).lower()
-    # unwrap Google News redirect if present
-    q = re.search(r"[?&]url=([^&]+)", u)
+    q = re.search(r"[?&]url=([^&]+)", u)  # unwrap Google News redirect
     if q:
         inner = requests.utils.unquote(q.group(1))
         dm = re.search(r"https?://([^/]+)/?", inner)
@@ -66,10 +73,10 @@ def unwrap_google_news(u: str):
 def human_ago(ts: int):
     delta = now_ts() - ts
     if delta < 60: return f"{delta}s ago"
-    minutes = delta // 60
-    if minutes < 60: return f"{minutes}m ago"
-    hours = minutes // 60
-    return f"{hours}h {minutes%60}m ago"
+    m = delta // 60
+    if m < 60: return f"{m}m ago"
+    h = m // 60
+    return f"{h}h {m%60}m ago"
 
 CRED_WEIGHTS = {
     "finance.yahoo.com": 1.2,
@@ -113,17 +120,48 @@ def fetch_items(ticker, name):
         title = getattr(e, "title", "")
         summary = getattr(e, "summary", "")
         link = getattr(e, "link", "")
-        score = senti(f"{title} {summary}")
         items.append({
-            "title": title, "url": link, "score": score, "pub_ts": get_pub_ts(e)
+            "title": title,
+            "summary": summary,
+            "url": link,
+            "pub_ts": get_pub_ts(e)
         })
-    # newest first (helps recency)
+    # newest first
     items.sort(key=lambda x: x["pub_ts"], reverse=True)
     return items
 
 def sha(u): return hashlib.sha1(u.encode()).hexdigest()
 
-# ================= ALERT FORMAT =================
+# =============== FinBERT ===============
+_FINBERT = None
+def _load_finbert():
+    global _FINBERT
+    if _FINBERT is not None: return _FINBERT
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline
+    model_name = "ProsusAI/finbert"
+    tok = AutoTokenizer.from_pretrained(model_name)
+    mdl = AutoModelForSequenceClassification.from_pretrained(model_name)
+    pipe = TextClassificationPipeline(model=mdl, tokenizer=tok, return_all_scores=True, truncation=True, max_length=256)
+    _FINBERT = pipe
+    return _FINBERT
+
+def finbert_scores(texts):
+    pipe = _load_finbert()
+    out_scores = []
+    B = 16
+    for i in range(0, len(texts), B):
+        batch = texts[i:i+B]
+        outputs = pipe(batch)
+        for res in outputs:
+            d = {r["label"].lower(): r["score"] for r in res}
+            score = float(d.get("positive", 0.0)) - float(d.get("negative", 0.0))
+            out_scores.append(score)
+    return out_scores
+
+def blended_score(finbert, vader, alpha=BLEND_ALPHA):
+    return alpha * finbert + (1 - alpha) * vader
+
+# =============== ALERT FORMAT ===============
 def format_alert(ticker, window_min, pos_hits, neg_hits):
     side_hits = pos_hits if sum(h["score"] for h in pos_hits) >= abs(sum(h["score"] for h in neg_hits)) else neg_hits
     side = "Bullish" if side_hits and side_hits[0]["score"] > 0 else "Bearish"
@@ -174,7 +212,7 @@ def maybe_alert(ticker, pos_hits, neg_hits, state):
     save_state(state)
     return True
 
-# ================= MAIN =================
+# =============== MAIN ===============
 def run_once():
     changed = False
     state = load_state()
@@ -193,8 +231,25 @@ def run_once():
             if it["pub_ts"] >= cutoff_ts:
                 window_items.append(it)
 
-        pos = [x for x in window_items if x["score"] >= STRONG_POS]
-        neg = [x for x in window_items if x["score"] <= STRONG_NEG]
+        finbert_pool = window_items[:FINBERT_MAX_ITEMS]
+        texts = [f"{x['title']} {x.get('summary','')}" for x in finbert_pool]
+
+        if texts:
+            try:
+                fb = finbert_scores(texts)
+            except Exception as e:
+                print("FinBERT error, falling back to VADER only:", e)
+                fb = [0.0] * len(texts)
+            vd = [senti_vader(t) for t in texts]
+            blended = [blended_score(f, v) for f, v in zip(fb, vd)]
+            for it, sc in zip(finbert_pool, blended):
+                it["score"] = sc
+
+        for it in window_items[len(finbert_pool):]:
+            it["score"] = senti_vader(f"{it['title']} {it.get('summary','')}")
+
+        pos = [x for x in window_items if x.get("score", 0) >= STRONG_POS]
+        neg = [x for x in window_items if x.get("score", 0) <= STRONG_NEG]
 
         if len(pos) >= CLUSTER_COUNT or len(neg) >= CLUSTER_COUNT:
             if maybe_alert(tkr, pos, neg, state):

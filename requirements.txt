@@ -1,3 +1,6 @@
 feedparser
 requests
 vaderSentiment
+transformers>=4.44.0
+torch>=2.3.0
+huggingface_hub>=0.23.0
