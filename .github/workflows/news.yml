@@ -1,1 +1,41 @@
+name: news-alerts
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes
+  workflow_dispatch:        # manual run button
 
+permissions:
+  contents: write           # allow committing state.json
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run news monitor
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python news_alert.py
+
+      - name: Commit state if changed
+        run: |
+          if [ -f ".state_changed" ]; then
+            rm .state_changed
+            git config user.name "gh-actions-bot"
+            git config user.email "actions@github.com"
+            git add state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: update state.json [skip ci]"
+              git push
+            fi
+          fi
