@@ -1,8 +1,8 @@
 name: news-alerts
 on:
   schedule:
-    - cron: "*/1 * * * *"   # every 10 minutes (UTC)
-  workflow_dispatch:          # allows manual run button
+    - cron: "*/10 * * * *"   # every 10 minutes (UTC)
+  workflow_dispatch:
 
 jobs:
   run:

@@ -1,5 +1,6 @@
-import os, json, time, datetime as dt, hashlib, re, math, requests, feedparser
+import os, json, time, datetime as dt, hashlib, re, requests, feedparser
 from pathlib import Path
+from urllib.parse import quote_plus
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ================= CONFIG =================
@@ -10,7 +11,7 @@ WATCHLIST = {
 }
 LOOKBACK_MIN = 180            # window for clustering (minutes)
 STRONG_POS = 0.6              # VADER positive threshold
-STRONG_NEG = -0.6             # negative threshold
+STRONG_NEG = -0.6              # VADER negative threshold
 CLUSTER_COUNT = 3             # how many strong hits to alert
 ALERT_COOLDOWN_MIN = 120      # min gap between alerts per ticker
 POLL_NEWS_HOURS = 6           # how far back to query in Google News
@@ -24,9 +25,11 @@ an = SentimentIntensityAnalyzer()
 def now_ts(): return int(dt.datetime.utcnow().timestamp())
 
 def google_news_rss(query: str):
-    return f"https://news.google.com/rss/search?q={query}+when:{POLL_NEWS_HOURS}h&hl=en-US&gl=US&ceid=US:en"
+    # URL-encode the query to avoid spaces/quotes issues
+    q = quote_plus(query)
+    return f"https://news.google.com/rss/search?q={q}+when:{POLL_NEWS_HOURS}h&hl=en-US&gl=US&ceid=US:en"
 
-def senti(text: str): return an.polarity_scores(text[:2000])["compound"]
+def senti(text: str): return an.polarity_scores((text or "")[:2000])["compound"]
 
 def get_pub_ts(entry):
     for k in ("published_parsed", "updated_parsed"):
@@ -48,6 +51,7 @@ def domain_from_url(u: str):
     m = re.search(r"https?://([^/]+)/?", u)
     if not m: return ""
     d = m.group(1).lower()
+    # unwrap Google News redirect if present
     q = re.search(r"[?&]url=([^&]+)", u)
     if q:
         inner = requests.utils.unquote(q.group(1))
@@ -76,7 +80,6 @@ CRED_WEIGHTS = {
     "marketbeat.com": 1.0,
 }
 DEFAULT_WEIGHT = 1.0
-
 def source_weight(u: str): return CRED_WEIGHTS.get(domain_from_url(u), DEFAULT_WEIGHT)
 
 def cluster_confidence(hits, window_min):
@@ -84,7 +87,7 @@ def cluster_confidence(hits, window_min):
     vol = len(hits)
     avg_abs = sum(abs(h["score"]) for h in hits)/vol
     avg_w = sum(source_weight(h["url"]) for h in hits)/vol
-    recency = max(0.5, min(1.0, 180 / window_min))
+    recency = max(0.5, min(1.0, 180 / max(1, window_min)))
     raw = vol * avg_abs * avg_w * recency
     if raw >= 4.0: return "High"
     if raw >= 2.0: return "Medium-High"
@@ -114,11 +117,13 @@ def fetch_items(ticker, name):
         items.append({
             "title": title, "url": link, "score": score, "pub_ts": get_pub_ts(e)
         })
+    # newest first (helps recency)
+    items.sort(key=lambda x: x["pub_ts"], reverse=True)
     return items
 
 def sha(u): return hashlib.sha1(u.encode()).hexdigest()
 
-# ================= ALERT LOGIC =================
+# ================= ALERT FORMAT =================
 def format_alert(ticker, window_min, pos_hits, neg_hits):
     side_hits = pos_hits if sum(h["score"] for h in pos_hits) >= abs(sum(h["score"] for h in neg_hits)) else neg_hits
     side = "Bullish" if side_hits and side_hits[0]["score"] > 0 else "Bearish"
@@ -178,6 +183,7 @@ def run_once():
     for tkr, name in WATCHLIST.items():
         seen = state["seen_ids"].setdefault(tkr, {})
         items = fetch_items(tkr, name)
+
         window_items = []
         for it in items:
             h = sha(it["url"])
